@@ -1,296 +1,352 @@
 """
-01_data_engineering.py — Data Engineering & Cleaning Pipeline
+01_data_engineering.py — Stage 1: Data Engineering & Cleaning.
 
-Key decisions documented inline:
-  - Missing values are classified as STRUCTURAL (wave didn't collect that field)
-    vs RANDOM (person skipped the question). Only RANDOM NaNs are imputed.
-  - Waves 6-9 use 1-10 scale for stated preferences → multiplied by 10.
-  - CLR transform applied to compositional stated-preference vectors to remove
-    the unit-sum constraint before regression / ML.
-  - T2/T3 columns are flagged and excluded from the model-ready dataset.
+Pipeline (sequential, each step is a pure function):
+
+    load_raw  →  validate  →  flag_structural_missings
+              →  harmonise_pref_scales  →  clr_transform
+              →  impute_random_missings  →  clip_rating_outliers
+              →  build_derived_features  →  build_model_ready_dataset
+
+Key scientific decisions (preserved from v1):
+
+  • Missing values classified as STRUCTURAL (not collected) vs RANDOM
+    (skipped). Only RANDOM NaNs imputed.
+  • Waves 6-9 stated-pref scale ×10 + row-renormalised to sum 100
+    (Fisman et al. 2006).
+  • CLR transform on compositional preference vectors (Aitchison 1986)
+    to remove unit-sum constraint before regression.
+  • T2/T3 columns excluded from model-ready dataset (anti-leakage).
+
+Engineering improvements over v1:
+
+  • Loguru structured logging (DEBUG/INFO/SUCCESS).
+  • Pydantic schema validation (fail-fast on raw & clean dataframes).
+  • Custom exception hierarchy (`DataEngineeringError`).
+  • `PipelineResult` dataclass — typed return contract.
+  • All paths via validated `settings` (no hardcoded paths).
+  • Pure functions — every step does df.copy() and returns new frame.
 """
 
+from __future__ import annotations
+
 import warnings
-from pathlib import Path
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
-from scipy.stats import zscore
 
-warnings.filterwarnings("ignore")
-
-# Local
-import sys
-sys.path.insert(0, str(Path(__file__).parent))
 from config import (
-    DATA_RAW, CLEAN_PARQUET, MODEL_PARQUET,
-    LIKERT_WAVES, STATED_PREF_COLS, STATED_PREF_CLR,
-    ATTR_DIMS, LEAKAGE_COLS, MODEL_FEATURES, MODEL_TARGET,
-    RATINGS_GIVEN, RATINGS_RECV, DEMO_COLS, LIFESTYLE_COLS,
-    CONTEXT_COLS, PARTNER_PREF_COLS, OUT_DATA,
+    ATTR_DIMS, LEAKAGE_COLS, LIFESTYLE_COLS, LIKERT_WAVES,
+    MODEL_FEATURES, MODEL_TARGET, PARTNER_PREF_COLS,
+    RATINGS_GIVEN, RATINGS_RECV, STATED_PREF_CLR, STATED_PREF_COLS,
+    settings,
 )
+from logging_config import get_logger
+from schemas import CleanDatasetContract, RawDatasetContract, SchemaValidationError
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+log = get_logger(__name__)
 
 
-# ── 1. Raw loader ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
+# Custom exceptions
+# ─────────────────────────────────────────────────────────────────────
+class DataEngineeringError(RuntimeError):
+    """Base class for errors raised in this stage."""
 
-def load_raw(path: Path = DATA_RAW) -> pd.DataFrame:
-    """Load the raw CSV with robust encoding and type coercion."""
-    df = pd.read_csv(
-        path,
-        encoding="latin-1",
-        low_memory=False,
-    )
-    # Coerce income: stored as '69,487.00' string
-    df["income"] = (
-        df["income"]
-        .astype(str)
-        .str.replace(",", "", regex=False)
-        .replace("nan", np.nan)
-        .astype(float)
-    )
-    print(f"[load]  raw shape: {df.shape}")
+
+class RawFileNotFoundError(DataEngineeringError):
+    """Raised when the raw CSV cannot be located."""
+
+
+class ImputationError(DataEngineeringError):
+    """Raised when imputation cannot complete."""
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Result contract
+# ─────────────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class PipelineResult:
+    clean_df: pd.DataFrame
+    model_df: pd.DataFrame
+    n_rows_raw: int
+    n_rows_clean: int
+    n_rows_model: int
+    target_positive_rate: float
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 1. Raw loader
+# ─────────────────────────────────────────────────────────────────────
+def load_raw(path=None) -> pd.DataFrame:
+    csv_path = settings.data_raw if path is None else path
+
+    if not csv_path.exists():
+        msg = (
+            f"Raw CSV not found at: {csv_path}\n"
+            f"  → Place 'Speed+Dating+Data.csv' in {csv_path.parent} "
+            f"or override SD_DATA_RAW in your .env file."
+        )
+        log.error(msg)
+        raise RawFileNotFoundError(msg)
+
+    log.info("Loading raw CSV from {path}", path=csv_path)
+    try:
+        df = pd.read_csv(csv_path, encoding="latin-1", low_memory=False)
+    except (UnicodeDecodeError, pd.errors.ParserError) as e:
+        raise DataEngineeringError(f"Failed to parse {csv_path}: {e}") from e
+
+    if "income" in df.columns:
+        df["income"] = (
+            df["income"].astype(str)
+            .str.replace(",", "", regex=False)
+            .replace("nan", np.nan)
+            .astype(float)
+        )
+
+    log.success("Raw loaded: {n_rows} rows × {n_cols} cols",
+                n_rows=df.shape[0], n_cols=df.shape[1])
     return df
 
 
-# ── 2. Structural vs random missing values ────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
+# 2. Schema validation
+# ─────────────────────────────────────────────────────────────────────
+def validate_raw(df: pd.DataFrame) -> pd.DataFrame:
+    try:
+        RawDatasetContract.validate_dataframe(df)
+    except SchemaValidationError as e:
+        log.error("Raw schema validation FAILED: {err}", err=str(e))
+        raise DataEngineeringError(f"Raw schema invalid: {e}") from e
+    log.info("Raw schema validated ✓")
+    return df
 
-def classify_and_flag_missings(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add boolean flags for STRUCTURAL missings.
 
-    Structural = a feature was simply not collected in a wave:
-      - T2/T3 follow-up columns in waves where follow-up wasn't done.
-      - attr4_* (ideal rating of opposite sex) was added in later waves.
-    
-    We do NOT impute structural NaNs — they carry information about design.
-    We only median-impute RANDOM missings within their wave×gender strata.
-    """
+# ─────────────────────────────────────────────────────────────────────
+# 3. Structural vs random missings
+# ─────────────────────────────────────────────────────────────────────
+def flag_structural_missings(df: pd.DataFrame) -> pd.DataFrame:
+    """Add boolean flags for STRUCTURAL missings (T2/T3 not collected)."""
     df = df.copy()
 
-    # Flag T2/T3 structural missings — useful for downstream filtering
-    for col in LEAKAGE_COLS:
-        if col in df.columns:
-            df[f"_STRUCTURAL_{col}"] = df[col].isna().astype(np.int8)
+    leak_present = [c for c in LEAKAGE_COLS if c in df.columns]
+    if leak_present:
+        flags = df[leak_present].isna().astype(np.int8)
+        flags.columns = [f"_STRUCTURAL_{c}" for c in flags.columns]
+        df = pd.concat([df, flags], axis=1)
+        log.debug("Added {n} structural-missing flags", n=len(flags.columns))
 
-    # Flag: was income missing? (often structural — person from abroad)
-    df["income_missing"] = df["income"].isna().astype(np.int8)
+    if "income" in df.columns:
+        df["income_missing"] = df["income"].isna().astype(np.int8)
 
-    print(f"[flags] structural-missing flags added")
     return df
 
 
-# ── 3. Scale harmonisation ────────────────────────────────────────────────────
-
+# ─────────────────────────────────────────────────────────────────────
+# 4. Stated-preference scale harmonisation
+# ─────────────────────────────────────────────────────────────────────
 def harmonise_stated_preference_scales(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Waves 6-9 collected stated preferences on a 1-10 Likert scale.
-    All other waves used a 100-point budget allocation.
-
-    Decision: multiply waves 6-9 values by 10 to bring them into [0, 100].
-    This is the canonical approach used in the original Fisman et al. paper.
-    We then renormalise to sum = 100 per row to restore compositionality.
-    """
+    """Bring all waves onto a common 100-pt allocation, then renormalise rows."""
     df = df.copy()
+    available = [c for c in STATED_PREF_COLS if c in df.columns]
+    if len(available) < len(STATED_PREF_COLS):
+        log.warning("Some stated-pref columns missing: {miss}",
+                    miss=set(STATED_PREF_COLS) - set(available))
+
     mask_likert = df["wave"].isin(LIKERT_WAVES)
+    if mask_likert.any():
+        df.loc[mask_likert, available] = df.loc[mask_likert, available] * 10
+        log.debug("Scaled {n} Likert-wave rows ×10", n=int(mask_likert.sum()))
 
-    # Scale up 1-10 → 0-100
-    df.loc[mask_likert, STATED_PREF_COLS] = (
-        df.loc[mask_likert, STATED_PREF_COLS] * 10
-    )
+    row_sums = df[available].sum(axis=1).replace(0, np.nan)
+    df[available] = df[available].div(row_sums, axis=0) * 100
 
-    # Re-normalise each row so it sums to 100
-    # (small deviations arise because people don't always allocate exactly 100)
-    row_sums = df[STATED_PREF_COLS].sum(axis=1).replace(0, np.nan)
-    for col in STATED_PREF_COLS:
-        df[col] = df[col] / row_sums * 100
-
-    print(f"[scale] preference scale harmonised (waves 6-9 ×10 + row-renorm)")
+    log.info("Preference scales harmonised (waves 6-9 ×10 + row-renorm)")
     return df
 
 
-# ── 4. CLR transformation ─────────────────────────────────────────────────────
-
+# ─────────────────────────────────────────────────────────────────────
+# 5. CLR (Centered Log-Ratio) transform
+# ─────────────────────────────────────────────────────────────────────
 def clr_transform(
     df: pd.DataFrame,
-    source_cols: list[str] = STATED_PREF_COLS,
-    target_cols: list[str] = STATED_PREF_CLR,
-    epsilon: float = 0.5,           # Adds small constant before log to handle zeros
+    source_cols: list[str] | None = None,
+    target_cols: list[str] | None = None,
+    epsilon: float = 0.5,
 ) -> pd.DataFrame:
     """
-    Centered Log-Ratio (CLR) transform for compositional preference vectors.
+    CLR transform — maps Aitchison simplex isometrically to ℝᴰ.
 
-    Why CLR?
-      Stated preferences sum to 100 (Aitchison simplex). Regressing directly on
-      simplex coordinates causes multicollinearity (perfect linear dependency)
-      and violates OLS assumptions. CLR maps the simplex isometrically to ℝᴰ
-      where Euclidean operations are valid.
-
-    CLR(xᵢ) = log(xᵢ + ε) − (1/D) · Σⱼ log(xⱼ + ε)
-
-    ε = 0.5 (Aitchison 1986 recommendation for zero-handling).
+        CLR(xᵢ) = log(xᵢ + ε) − (1/D) · Σⱼ log(xⱼ + ε)
     """
+    source_cols = source_cols or STATED_PREF_COLS
+    target_cols = target_cols or STATED_PREF_CLR
+
     df = df.copy()
-    X = df[source_cols].values.astype(float)
+    available = [c for c in source_cols if c in df.columns]
+    if not available:
+        log.warning("No source columns for CLR — skipping")
+        return df
 
-    # Add epsilon to handle zeros before log
+    X = df[available].to_numpy(dtype=float, na_value=np.nan)
     X_eps = X + epsilon
+    log_X = np.log(X_eps)
+    log_gm = log_X.mean(axis=1, keepdims=True)
+    X_clr = log_X - log_gm
 
-    log_X   = np.log(X_eps)
-    log_gm  = log_X.mean(axis=1, keepdims=True)   # log geometric mean
-    X_clr   = log_X - log_gm
+    clr_block = pd.DataFrame(X_clr, columns=target_cols, index=df.index)
+    df = pd.concat([df, clr_block], axis=1)
 
-    for i, col in enumerate(target_cols):
-        df[col] = X_clr[:, i]
-
-    print(f"[CLR]   {len(source_cols)} attributes transformed → {target_cols[:2]}…")
+    log.info("CLR transform applied → {n} columns", n=len(target_cols))
     return df
 
 
-# ── 5. Random missing imputation ──────────────────────────────────────────────
-
+# ─────────────────────────────────────────────────────────────────────
+# 6. Random-missing imputation
+# ─────────────────────────────────────────────────────────────────────
 def impute_random_missings(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Median imputation within wave × gender strata for RANDOM missings.
-
-    We use median (not mean) because preference and rating variables tend
-    to be left-skewed (people over-rate partners). Stratifying by wave×gender
-    preserves distributional differences across experimental conditions.
-
-    Imputed columns: event-night ratings, demographic scores, lifestyle.
-    We do NOT impute stated preferences (handled after CLR above).
-    """
+    """Median imputation within wave × gender strata for RANDOM missings."""
     df = df.copy()
-    IMPUTE_COLS = (
-        RATINGS_GIVEN + RATINGS_RECV
-        + PARTNER_PREF_COLS
-        + LIFESTYLE_COLS
+
+    impute_cols = (
+        RATINGS_GIVEN + RATINGS_RECV + PARTNER_PREF_COLS + LIFESTYLE_COLS
         + ["age", "age_o", "imprace", "imprelig", "income"]
     )
+    impute_cols = [c for c in impute_cols if c in df.columns]
 
-    for col in IMPUTE_COLS:
-        if col not in df.columns:
-            continue
+    n_imputed = 0
+    for col in impute_cols:
         is_null = df[col].isna()
-        if is_null.sum() == 0:
+        if not is_null.any():
             continue
 
-        # Strata median imputation
-        strat_median = df.groupby(["wave", "gender"])[col].transform("median")
-        # Fall back to global median if strata has no data
+        strat_median = df.groupby(["wave", "gender"], observed=True)[col].transform("median")
         global_median = df[col].median()
+
+        if pd.isna(global_median):
+            raise ImputationError(
+                f"Column '{col}' has no valid values to compute global median."
+            )
+
         df[col] = df[col].fillna(strat_median).fillna(global_median)
+        n_imputed += int(is_null.sum())
 
-    print(f"[impute] random missings imputed via stratified median")
+    log.info("Imputed {n} random missings via stratified median", n=n_imputed)
     return df
 
 
-# ── 6. Outlier handling ───────────────────────────────────────────────────────
-
+# ─────────────────────────────────────────────────────────────────────
+# 7. Outlier clipping
+# ─────────────────────────────────────────────────────────────────────
 def clip_rating_outliers(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Clip event-night ratings to [1, 10] — the valid response range.
-    A handful of rows have values outside this range due to data-entry errors.
-    We clip rather than drop to preserve the observation.
-    """
     df = df.copy()
-    for col in RATINGS_GIVEN + RATINGS_RECV:
-        if col in df.columns:
-            df[col] = df[col].clip(lower=1, upper=10)
+    rating_cols = [c for c in RATINGS_GIVEN + RATINGS_RECV if c in df.columns]
+    if rating_cols:
+        before = df[rating_cols].apply(lambda s: ((s < 1) | (s > 10)).sum()).sum()
+        df[rating_cols] = df[rating_cols].clip(lower=1, upper=10)
+        if before:
+            log.debug("Clipped {n} rating values outside [1,10]", n=int(before))
     return df
 
 
-# ── 7. Derived features ───────────────────────────────────────────────────────
-
+# ─────────────────────────────────────────────────────────────────────
+# 8. Derived features
+# ─────────────────────────────────────────────────────────────────────
 def build_derived_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Create analytically useful composite variables for EDA and modelling.
-
-    - attr_gap: partner's attractiveness rating vs person's stated ideal
-    - pref_alignment: cosine similarity between person's CLR prefs and
-                      their actual ratings (stated ≈ revealed?)
-    - selectivity: how often this person said YES (proportion in wave)
-    """
     df = df.copy()
 
-    # Preference–behaviour gap: stated importance vs actual rating weight
-    # (positive = over-weights, negative = under-weights in practice)
     for dim in ATTR_DIMS:
-        stated_col  = f"{dim}1_1"
-        rating_col  = dim
+        stated_col, rating_col = f"{dim}1_1", dim
         if stated_col in df.columns and rating_col in df.columns:
             df[f"{dim}_gap"] = df[rating_col] - (df[stated_col] / 10)
 
-    # Partner's average rating received (proxy for overall attractiveness)
     recv_cols = [f"{d}_o" for d in ATTR_DIMS if f"{d}_o" in df.columns]
-    df["partner_avg_rating"] = df[recv_cols].mean(axis=1)
+    if recv_cols:
+        df["partner_avg_rating"] = df[recv_cols].mean(axis=1)
 
-    # Selectivity: fraction of yeses given by this person in their wave
     df["selectivity"] = df.groupby("iid")["dec"].transform("mean")
 
-    # Reciprocity signal: did partner also say yes?
-    df["dec_o_numeric"] = df["dec_o"].astype(float)
+    if "dec_o" in df.columns:
+        df["dec_o_numeric"] = pd.to_numeric(df["dec_o"], errors="coerce")
 
-    print(f"[derived] gap, selectivity, partner_avg_rating computed")
+    log.info("Derived features built (gap, selectivity, partner_avg_rating)")
     return df
 
 
-# ── 8. Anti-leakage final filter ──────────────────────────────────────────────
-
+# ─────────────────────────────────────────────────────────────────────
+# 9. Anti-leakage final filter → model-ready dataset
+# ─────────────────────────────────────────────────────────────────────
 def build_model_ready_dataset(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Return a feature matrix that contains ONLY T1-safe columns plus the target.
-
-    Anti-leakage protocol:
-      - All _2 (day-after) and _3 (3-week) columns are excluded.
-      - `match` is excluded because it's simultaneously determined with `dec`.
-      - `dec_o` is excluded because it's the partner's simultaneous decision.
-      - Only rows with a valid `dec` label are kept.
-    """
-    # Resolve which of the declared MODEL_FEATURES actually exist
     available = [c for c in MODEL_FEATURES if c in df.columns]
-
-    # Also include the derived gap features
     gap_cols = [c for c in df.columns if c.endswith("_gap")]
-    extra_cols = ["selectivity", "partner_avg_rating", "iid", "wave", MODEL_TARGET]
+    extras = ["selectivity", "partner_avg_rating", "iid", "wave", MODEL_TARGET]
 
-    keep = list(dict.fromkeys(available + gap_cols + extra_cols))
+    keep = list(dict.fromkeys(available + gap_cols + extras))
     keep = [c for c in keep if c in df.columns]
 
     model_df = df[keep].dropna(subset=[MODEL_TARGET]).copy()
     model_df[MODEL_TARGET] = model_df[MODEL_TARGET].astype(int)
 
-    print(f"[model]  model-ready shape: {model_df.shape}  "
-          f"| target positive rate: {model_df[MODEL_TARGET].mean():.2%}")
+    log.info(
+        "Model-ready dataset: {shape} | target positive rate {rate:.2%}",
+        shape=model_df.shape, rate=model_df[MODEL_TARGET].mean(),
+    )
     return model_df
 
 
-# ── 9. Pipeline orchestrator ──────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
+# 10. Orchestrator
+# ─────────────────────────────────────────────────────────────────────
+def run_data_engineering() -> PipelineResult:
+    """Execute Stage 1 end-to-end. Returns a typed `PipelineResult`."""
+    log.info("─" * 60)
+    log.info("STAGE 1 | Data Engineering & Cleaning")
+    log.info("─" * 60)
 
-def run_data_engineering() -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Execute the full data-engineering pipeline end-to-end.
-    Returns (clean_df, model_df).
-    """
-    OUT_DATA.mkdir(parents=True, exist_ok=True)
+    settings.out_data.mkdir(parents=True, exist_ok=True)
 
-    df = load_raw()
-    df = classify_and_flag_missings(df)
-    df = harmonise_stated_preference_scales(df)
-    df = clr_transform(df)
-    df = impute_random_missings(df)
-    df = clip_rating_outliers(df)
-    df = build_derived_features(df)
+    try:
+        df = load_raw()
+        n_raw = len(df)
 
-    # Persist clean dataset (all columns, no leakage concern yet)
-    df.to_parquet(CLEAN_PARQUET, index=False)
-    print(f"[save]   clean parquet → {CLEAN_PARQUET}")
+        df = validate_raw(df)
+        df = flag_structural_missings(df)
+        df = harmonise_stated_preference_scales(df)
+        df = clr_transform(df)
+        df = impute_random_missings(df)
+        df = clip_rating_outliers(df)
+        df = build_derived_features(df)
 
-    # Build and persist model-ready dataset
-    model_df = build_model_ready_dataset(df)
-    model_df.to_parquet(MODEL_PARQUET, index=False)
-    print(f"[save]   model parquet → {MODEL_PARQUET}")
+        try:
+            CleanDatasetContract.validate_dataframe(df)
+        except SchemaValidationError as e:
+            raise DataEngineeringError(f"Clean schema invalid: {e}") from e
 
-    return df, model_df
+        df.to_parquet(settings.clean_parquet, index=False)
+        log.success("Clean parquet → {p}", p=settings.clean_parquet)
+
+        model_df = build_model_ready_dataset(df)
+        model_df.to_parquet(settings.model_parquet, index=False)
+        log.success("Model parquet → {p}", p=settings.model_parquet)
+
+        result = PipelineResult(
+            clean_df=df,
+            model_df=model_df,
+            n_rows_raw=n_raw,
+            n_rows_clean=len(df),
+            n_rows_model=len(model_df),
+            target_positive_rate=float(model_df[MODEL_TARGET].mean()),
+        )
+        log.success("Stage 1 complete ✓")
+        return result
+
+    except DataEngineeringError:
+        raise
+    except Exception as e:
+        log.exception("Unexpected failure in data-engineering stage")
+        raise DataEngineeringError(f"Stage 1 failed: {e}") from e
 
 
 if __name__ == "__main__":
